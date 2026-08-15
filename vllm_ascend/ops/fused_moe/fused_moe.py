@@ -16,7 +16,7 @@
 #
 import torch
 import torch.nn.functional as F
-from vllm.distributed import get_dp_group, get_ep_group, get_tp_group
+from vllm.distributed import get_dp_group, get_ep_group, get_tp_group, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig, FusedMoERouter
 from vllm.model_executor.layers.fused_moe.layer import MoERunner
 
@@ -91,6 +91,18 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         return False
 
     @property
+    def _allgather_requires_early_routed_reduce(self) -> bool:
+        # Back-ported from fused_moe_0_23_0 (v0.23 semantics). AllGather +
+        # a routed_output_transform (latent MoE, e.g. Kimi-K3: RMSNorm +
+        # up_proj) requires summing the per-rank partials BEFORE the
+        # nonlinear transform: RMSNorm(allreduce(x)) != allreduce(RMSNorm(x)).
+        return (
+            _EXTRA_CTX.moe_comm_type == MoECommType.ALLGATHER
+            and not _EXTRA_CTX.flash_comm_v1_enabled
+            and getattr(self, "routed_output_transform", None) is not None
+        )
+
+    @property
     def _fused_output_is_reduced(self) -> bool:
         # For MC2/ALLTOALL/FUSED_MC2 comm types, finalize() already includes
         # TP all-reduce for the routed output, and AscendSharedExperts.forward
@@ -98,11 +110,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # MoERunner.forward() so _maybe_reduce_final_output does not apply a
         # second TP all-reduce (which would double-count the contributions).
         moe_comm_type = _EXTRA_CTX.moe_comm_type
-        return moe_comm_type in {
-            MoECommType.ALLTOALL,
-            MoECommType.MC2,
-            MoECommType.FUSED_MC2,
-        } or (moe_comm_type == MoECommType.ALLGATHER and _EXTRA_CTX.flash_comm_v1_enabled)
+        return (
+            moe_comm_type
+            in {
+                MoECommType.ALLTOALL,
+                MoECommType.MC2,
+                MoECommType.FUSED_MC2,
+            }
+            or (moe_comm_type == MoECommType.ALLGATHER and _EXTRA_CTX.flash_comm_v1_enabled)
+            or (self._allgather_requires_early_routed_reduce)
+        )
 
     @property
     def local_num_experts(self) -> int:
@@ -121,6 +138,10 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # Ascend handles shared expert reduction in
         # _forward_shared_experts; the upstream kwarg is unused here.
         _ = fused_output_is_reduced
+        if shared_output is not None and self._allgather_requires_early_routed_reduce:
+            # Latent MoE on AllGather: reduce the shared output here to
+            # match the pre-transform routed reduce (see below).
+            shared_output = tensor_model_parallel_all_reduce(shared_output)
         return shared_output
 
     def _maybe_reduce_final_output(  # type: ignore[misc]
@@ -130,10 +151,21 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         output_is_reduced: bool | None = None,
     ) -> torch.Tensor:
         _ = output_is_reduced
-        states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
+        if not self._allgather_requires_early_routed_reduce:
+            states = torch.ops.vllm.maybe_all_reduce_tensor_model_parallel(states)
         if trunc_size is not None and trunc_size > 0:
             return states[..., :trunc_size]
         return states
+
+    def apply_routed_output_transform(
+        self,
+        fused_output: torch.Tensor,
+    ) -> torch.Tensor:
+        if self._allgather_requires_early_routed_reduce:
+            # Latent MoE on AllGather: sum the per-rank routed partials
+            # BEFORE the nonlinear transform (v0.23 early-reduce semantics).
+            fused_output = tensor_model_parallel_all_reduce(fused_output)
+        return super().apply_routed_output_transform(fused_output)
 
     def set_lora_context(self, lora_context):
         self.routed_experts._ascend_moe_lora_context = lora_context
