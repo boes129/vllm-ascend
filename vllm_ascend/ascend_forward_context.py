@@ -44,6 +44,14 @@ _MEGA_MOE_SUPPORTED = importlib.util.find_spec("cann_ops_transformer") is not No
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 4096
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
+# A2 minimum provisioned MC2 tokens capacity for correct results. The startup
+# warmup (profile_run) provisions the CANN dispatch/combine plan at exactly
+# mc2_tokens_capacity tokens; below this floor every subsequent MC2 forward
+# silently returns wrong outputs, independent of the actual per-forward batch
+# size (observed on 910B / CANN 9.1.0, 896-expert MoE, EP64: capacity
+# 8/64/128 -> wrong outputs ranging from wrong digits to full garbage;
+# 256/512 -> correct).
+_MC2_MIN_SAFE_TOKENS_CAPACITY = 256
 
 
 @contextmanager
@@ -259,11 +267,16 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
         else:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)
+        _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
 
-    # keep the num_tokens_per_tp_rank less than mc2 tokens per rank limit
+    # Plain MC2: TP shards weights, not tokens - every TP rank processes the
+    # full batch, so the capacity is the batch token limit itself, clamped to
+    # the per-rank kernel limit. The former ceil(x/tp)*tp round-trip inflated
+    # it above the limit (enable_prefill_mc2 with max_num_batched_tokens=2048
+    # and tp_size=8 produced 2048 instead of 512), routing over-limit batches
+    # into MC2 and hanging the dispatch kernel on A2.
     else:
-        num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MC2_TOKENS_PER_RANK_LIMIT)
-    _mc2_tokens_capacity = num_tokens_per_tp_rank * tp_size
+        _mc2_tokens_capacity = min(max_num_tokens, _MC2_TOKENS_PER_RANK_LIMIT)
 
 
 def get_mc2_tokens_capacity():
@@ -297,6 +310,12 @@ def _select_a2_moe_comm_method(
     )
     num_experts_per_device = num_experts // ep_world_size
     if num_experts > 512:
+        return MoECommType.ALLGATHER
+    # MC2 provisioned below the observed safe minimum silently returns wrong
+    # outputs on A2 (see _MC2_MIN_SAFE_TOKENS_CAPACITY): the corruption is
+    # independent of the actual batch size, so gating on the provisioned
+    # capacity is the only reliable guard. Fall back to AllGather instead.
+    if mc2_tokens_capacity < _MC2_MIN_SAFE_TOKENS_CAPACITY:
         return MoECommType.ALLGATHER
     if num_experts_per_device <= 24 and ep_world_size >= 16 and num_tokens <= mc2_tokens_capacity:
         return MoECommType.MC2

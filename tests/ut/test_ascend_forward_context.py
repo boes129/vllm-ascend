@@ -82,15 +82,18 @@ def _patch_select_moe_comm_method_deps(
     )
 
 
-def test_set_mc2_tokens_capacity_without_cudagraph_aligns_per_tp_rank():
+def test_set_mc2_tokens_capacity_without_cudagraph_clamps_to_kernel_limit():
+    # 200 reqs x 3 decode tokens = 600; TP shards weights, not tokens, so the
+    # capacity is the batch token limit clamped to the 512 per-rank kernel
+    # limit (the former per-tp-rank alignment produced 600).
     vllm_config = _make_vllm_config(tensor_parallel_size=6)
 
     afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=200, uniform_decode_query_len=3)
 
-    assert afc.get_mc2_tokens_capacity() == 600
+    assert afc.get_mc2_tokens_capacity() == 512
 
 
-def test_set_mc2_tokens_capacity_with_cudagraph_uses_capture_size_and_aligns():
+def test_set_mc2_tokens_capacity_with_cudagraph_uses_capture_size():
     vllm_config = _make_vllm_config(
         tensor_parallel_size=8,
         cudagraph_capture_sizes=[1, 2],
@@ -99,7 +102,7 @@ def test_set_mc2_tokens_capacity_with_cudagraph_uses_capture_size_and_aligns():
 
     afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=16, uniform_decode_query_len=1)
 
-    assert afc.get_mc2_tokens_capacity() == 264
+    assert afc.get_mc2_tokens_capacity() == 257
 
 
 def test_set_mc2_tokens_capacity_prefill_mc2_uses_max_num_batched_tokens(monkeypatch):
@@ -112,7 +115,23 @@ def test_set_mc2_tokens_capacity_prefill_mc2_uses_max_num_batched_tokens(monkeyp
 
     afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=16, uniform_decode_query_len=1)
 
-    assert afc.get_mc2_tokens_capacity() == 520
+    assert afc.get_mc2_tokens_capacity() == 512
+
+
+def test_set_mc2_tokens_capacity_prefill_mc2_clamps_above_kernel_limit(monkeypatch):
+    # enable_prefill_mc2 with a large max_num_batched_tokens must not raise
+    # the capacity above the 512 per-rank kernel limit: over-limit batches
+    # used to enter MC2 and hang the dispatch kernel on A2.
+    monkeypatch.setattr(
+        afc,
+        "get_ascend_config",
+        lambda: SimpleNamespace(enable_prefill_mc2=True, enable_fused_mc2=0),
+    )
+    vllm_config = _make_vllm_config(tensor_parallel_size=8, max_num_batched_tokens=2048)
+
+    afc.set_mc2_tokens_capacity(vllm_config, max_num_reqs=256, uniform_decode_query_len=8)
+
+    assert afc.get_mc2_tokens_capacity() == 512
 
 
 def test_select_moe_comm_method_returns_none_for_non_moe(monkeypatch):
@@ -150,15 +169,41 @@ def test_select_moe_comm_method_uses_allgather_without_effective_expert_parallel
 @pytest.mark.parametrize(
     ("num_tokens", "expected"),
     [
-        (128, MoECommType.MC2),
-        (129, MoECommType.ALLGATHER),
+        (512, MoECommType.MC2),
+        (513, MoECommType.ALLGATHER),
     ],
 )
 def test_select_moe_comm_method_a2_uses_mc2_within_capacity(monkeypatch, num_tokens, expected):
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=afc.AscendDeviceType.A2,
-        capacity=128,
+        capacity=512,
+        ep_world_size=16,
+    )
+    vllm_config = _make_vllm_config(world_size=16, num_experts=128)
+
+    assert afc.select_moe_comm_method(num_tokens, vllm_config) == expected
+
+
+@pytest.mark.parametrize(
+    ("capacity", "num_tokens", "expected"),
+    [
+        (8, 8, MoECommType.ALLGATHER),
+        (128, 128, MoECommType.ALLGATHER),
+        (256, 256, MoECommType.MC2),
+        (512, 1, MoECommType.MC2),
+    ],
+)
+def test_select_moe_comm_method_a2_gates_mc2_below_safe_capacity_floor(
+    monkeypatch, capacity, num_tokens, expected
+):
+    # Below the observed safe minimum the A2 CANN dispatch/combine plan is
+    # under-provisioned and MC2 silently returns wrong outputs regardless of
+    # the batch size; the selector must fall back to AllGather.
+    _patch_select_moe_comm_method_deps(
+        monkeypatch,
+        device_type=afc.AscendDeviceType.A2,
+        capacity=capacity,
         ep_world_size=16,
     )
     vllm_config = _make_vllm_config(world_size=16, num_experts=128)
@@ -170,7 +215,7 @@ def test_select_moe_comm_method_a2_uses_allgather_for_more_than_512_experts(monk
     _patch_select_moe_comm_method_deps(
         monkeypatch,
         device_type=afc.AscendDeviceType.A2,
-        capacity=128,
+        capacity=512,
         ep_world_size=64,
     )
     vllm_config = _make_vllm_config(world_size=64, num_experts=896)
