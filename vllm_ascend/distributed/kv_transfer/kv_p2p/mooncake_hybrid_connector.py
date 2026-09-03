@@ -88,6 +88,16 @@ class MooncakeAgentMetadata(msgspec.Struct, omit_defaults=True, dict=True):
     block_lens: list[int]
     ssm_sizes: tuple[int, int]
     local_ip: str = ""
+    # Per-addr transformer layer indices behind each flat addr (compress-branch
+    # layout: one addr per kv_cache_tensor with non-empty shared_by). Lets a
+    # PP pull peer pair addrs by content instead of position.
+    addr_layer_ids: list[list[int]] | None = None
+
+
+def _parse_layer_idx(layer_name: str) -> int | None:
+    """Transformer layer index parsed from a KV-cache layer name, if any."""
+    match = re.search(r"layers\.(\d+)", str(layer_name))
+    return int(match.group(1)) if match else None
 
 
 @dataclass
@@ -405,7 +415,11 @@ class KVCacheRecvingThread(threading.Thread):
         self.hma_group_size = hma_group_size
         self.mamba_ssm_size = mamba_ssm_size
         self.remote_te_port: dict[str, dict[int, int]] = SizedDict()
+        self.remote_addr_layer_ids: dict[str, dict[int, list[list[int]] | None]] = SizedDict()
+        self.remote_block_lens: dict[str, dict[int, list[int]]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
+        self._layer_to_group: dict[int, frozenset[int]] | None = None
+        self._pp_align_tables_logged: set[tuple[str, int]] = set()
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
@@ -579,6 +593,122 @@ class KVCacheRecvingThread(threading.Thread):
             self.finished_request_markers.discard(request_id)
             return has_finished_marker
 
+    def _get_addr_layer_indices(self) -> list[frozenset[int]] | None:
+        """Layer indices behind each flat addr, or None if the layout cannot
+        be replayed.
+
+        Replays the worker-side construction (compress branch of
+        register_kv_caches): one addr per kv_cache_tensor with non-empty
+        shared_by, in kv_cache_tensors iteration order, so the k-th entry
+        here corresponds to the k-th entry of block_len_per_addr. Layouts
+        built by other branches (e.g. the mamba ptr-dedup walk) may not be
+        1:1 with kv_cache_tensors; return None for those so callers can fall
+        back to the uniform slicing.
+        """
+        if not self._addr_layer_indices_checked:
+            addr_layer_indices: list[frozenset[int]] = []
+            for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
+                if not kv_cache_tensor.shared_by:
+                    continue
+                layers = set()
+                for layer_name in kv_cache_tensor.shared_by:
+                    layer_idx = _parse_layer_idx(layer_name)
+                    # Skip names without a parseable layer index (e.g. draft
+                    # layers beyond num_hidden_layers) so they never pin an
+                    # addr to a stage range.
+                    if layer_idx is not None and layer_idx < self.num_layers:
+                        layers.add(layer_idx)
+                addr_layer_indices.append(frozenset(layers))
+            if len(addr_layer_indices) != len(self.block_len_per_addr):
+                logger.debug(
+                    "Cross-PP pull alignment: addr provenance replay mismatch "
+                    "(%d kv_cache_tensors vs %d flat addrs), falling back to uniform slicing",
+                    len(addr_layer_indices),
+                    len(self.block_len_per_addr),
+                )
+                addr_layer_indices = None
+            self._addr_layer_indices = addr_layer_indices
+            self._addr_layer_indices_checked = True
+        return self._addr_layer_indices
+
+    def _get_stage_addr_indices(self, first_layer: int, end_layer: int) -> list[int] | None:
+        """Indices of flat addrs whose layers fall in [first_layer, end_layer),
+        or None when the addr layout has no layer provenance."""
+        addr_layer_indices = self._get_addr_layer_indices()
+        if addr_layer_indices is None:
+            return None
+        key = (first_layer, end_layer)
+        if key not in self._stage_addr_indices:
+            self._stage_addr_indices[key] = [
+                k
+                for k, layers in enumerate(addr_layer_indices)
+                if any(first_layer <= layer_idx < end_layer for layer_idx in layers)
+            ]
+        return self._stage_addr_indices[key]
+
+    def _get_layer_to_group(self) -> dict[int, frozenset[int]]:
+        """Map transformer layer index -> set of local kv cache group ids."""
+        if self._layer_to_group is None:
+            mapping: dict[int, set[int]] = defaultdict(set)
+            for group_idx, group in enumerate(self.kv_cache_config.kv_cache_groups):
+                for layer_name in group.layer_names:
+                    layer_idx = _parse_layer_idx(layer_name)
+                    if layer_idx is not None:
+                        mapping[layer_idx].add(group_idx)
+            self._layer_to_group = {k: frozenset(v) for k, v in mapping.items()}
+        return self._layer_to_group
+
+    def _remote_groups_for_layers(self, remote_layers: list[int]) -> frozenset[int]:
+        """Local group ids covering the given (remote) layer indices."""
+        layer_to_group = self._get_layer_to_group()
+        groups: set[int] = set()
+        for layer_idx in remote_layers:
+            groups.update(layer_to_group.get(layer_idx, frozenset()))
+        return frozenset(groups)
+
+    def _build_stage_addr_pairs(
+        self,
+        first_layer: int,
+        end_layer: int,
+        keep: list[int],
+        remote_layers: list[list[int]],
+    ) -> list[tuple[int, int]]:
+        """Pair D addrs with remote-stage addrs by shared layers, not position.
+
+        P-side kv_cache_tensors are packed per stage and may split or merge
+        regions differently than D's full-model table, so equal lengths do not
+        imply positional correspondence. Each pair (k, r) means: D addr k and
+        remote addr r overlap in at least one layer of [first_layer, end_layer);
+        the per-group filter in the transfer loop routes each group to the
+        exact pair serving it on both sides.
+        """
+        stage_layers = frozenset(range(first_layer, end_layer))
+        remote_sets = [stage_layers & frozenset(rl) for rl in remote_layers]
+        pairs: list[tuple[int, int]] = []
+        unmatched: list[tuple[int, list[int]]] = []
+        for k in keep:
+            need = self._get_addr_layer_indices()[k] & stage_layers
+            matched = [(k, r) for r, remote_set in enumerate(remote_sets) if need & remote_set]
+            if matched:
+                pairs.extend(matched)
+            else:
+                unmatched.append((k, sorted(need)))
+        if unmatched:
+            raise ValueError(
+                f"Cross-PP pull alignment: local addrs with no remote counterpart in stage "
+                f"[{first_layer},{end_layer}): {unmatched}"
+            )
+        used = {r for _, r in pairs}
+        unused = [r for r, remote_set in enumerate(remote_sets) if r not in used and remote_set]
+        if unused:
+            logger.warning(
+                "Cross-PP pull alignment: remote addrs never paired in stage [%d,%d): %s",
+                first_layer,
+                end_layer,
+                [(r, sorted(remote_sets[r])) for r in unused],
+            )
+        return pairs
+
     def _handle_request(self, req_meta: dict[str, Any]):
         request_id = req_meta["request_id"]
         remote_request_id = req_meta["remote_request_id"]
@@ -656,12 +786,20 @@ class KVCacheRecvingThread(threading.Thread):
             remote_kv_caches_base_addrs = self.kv_caches_base_addr[remote_engine_id][remote_handshake_port]
             local_kv_caches_base_addrs = self.kv_caches_base_addr[self.local_engine_id][self.local_handshake_port]
             remote_transfer_port = self.remote_te_port[remote_engine_id][remote_handshake_port]
+            remote_layers = self.remote_addr_layer_ids[remote_engine_id].get(remote_handshake_port)
+            remote_stride_list = self.remote_block_lens[remote_engine_id].get(remote_handshake_port)
         session_id = f"{remote_host}:{remote_transfer_port}"
 
+        # Pairing plan for the addr loop: None entries pair positionally
+        # (pre-PP behavior / fallback); (k, r) pairs pair D addr k with remote
+        # addr r by layer content.
+        xfer_pairs: list[tuple[int, int | None]] | None = None
+        remote_group_sets: list[frozenset[int]] | None = None
+
         # With P-side PP the remote worker only owns its stage's
-        # kv_cache_tensors. Offset the local (D) group-major flat addr list to
-        # the remote stage's global group range before zipping, so stage-1
-        # data lands in D's groups 8-15 instead of overwriting groups 0-7.
+        # kv_cache_tensors, packed per stage — its table may split or merge
+        # regions differently than D's full-model table, so D must pair addrs
+        # by layer content, never by position or a uniform slice assumption.
         local_addrs = local_kv_caches_base_addrs
         block_len_arr = self.block_len_per_addr
         block_stride_arr = self.block_stride_per_addr
@@ -669,32 +807,102 @@ class KVCacheRecvingThread(threading.Thread):
         if self._prefill_pp_size > 1:
             tp_num_need_pulls = req_meta["tp_num_need_pulls"]
             remote_pp_rank = req_meta["offset"] // tp_num_need_pulls
-            num_groups = len(self.kv_cache_config.kv_cache_tensors)
-            groups_per_stage = num_groups // self._prefill_pp_size
-            addrs_per_group, rem = divmod(len(local_addrs), num_groups)
-            if rem != 0:
-                raise ValueError("non-uniform per-group address counts unsupported")
-            if num_groups % self._prefill_pp_size != 0:
-                raise ValueError("pp split not group-aligned")
-            start = remote_pp_rank * groups_per_stage * addrs_per_group
-            end = (remote_pp_rank + 1) * groups_per_stage * addrs_per_group
-            local_addrs = local_addrs[start:end]
-            block_len_arr = self.block_len_per_addr[start:end]
-            block_stride_arr = self.block_stride_per_addr[start:end]
-            if addr_group_arr:
-                addr_group_arr = self.addr_group_idx[start:end]
-            logger.debug(
-                "Cross-PP pull alignment: remote_port=%d -> pp_rank=%d local_addrs[%d:%d]=%d remote=%d",
-                remote_handshake_port,
-                remote_pp_rank,
-                start,
-                end,
-                len(local_addrs),
-                len(remote_kv_caches_base_addrs),
-            )
+            if remote_pp_rank not in self.pp_layer_indices:
+                raise ValueError(
+                    f"Cross-PP pull alignment: remote_pp_rank={remote_pp_rank} has no layer range "
+                    f"(pp_layer_indices={self.pp_layer_indices})"
+                )
+            first_layer, end_layer = self.pp_layer_indices[remote_pp_rank]
+            keep = self._get_stage_addr_indices(first_layer, end_layer)
+            if keep is not None and remote_layers is not None:
+                # Content-based pairing: D addr k <-> remote addr r whenever
+                # their layer sets overlap inside the stage. No positional or
+                # count assumptions; the transfer loop's per-group filter
+                # (local + remote group membership) routes each group exactly.
+                xfer_pairs = self._build_stage_addr_pairs(first_layer, end_layer, keep, remote_layers)
+                remote_group_sets = [self._remote_groups_for_layers(rl) for rl in remote_layers]
+                log_key = (remote_engine_id, remote_handshake_port)
+                if log_key not in self._pp_align_tables_logged:
+                    self._pp_align_tables_logged.add(log_key)
+                    addr_layers = self._get_addr_layer_indices()
+                    logger.info(
+                        "Cross-PP align tables %s:%d stage=[%d,%d): D addrs(layers,block_len)=%s "
+                        "remote addrs(layers,block_len)=%s",
+                        remote_engine_id,
+                        remote_handshake_port,
+                        first_layer,
+                        end_layer,
+                        [(k, sorted(addr_layers[k]), self.block_len_per_addr[k]) for k in keep],
+                        [
+                            (r, rl, remote_stride_list[r] if remote_stride_list else None)
+                            for r, rl in enumerate(remote_layers)
+                        ],
+                    )
+                logger.info(
+                    "Cross-PP pull alignment: remote_port=%d -> pp_rank=%d layers=[%d,%d) "
+                    "pairs=%d (D addrs %d/%d, remote %d)",
+                    remote_handshake_port,
+                    remote_pp_rank,
+                    first_layer,
+                    end_layer,
+                    len(xfer_pairs),
+                    len({k for k, _ in xfer_pairs}),
+                    len(self.block_len_per_addr),
+                    len(remote_kv_caches_base_addrs),
+                )
+            elif keep is not None:
+                # Remote handshake carries no layer provenance: positional
+                # pairing with a strict count check (fails loudly instead of
+                # mispairing when P/D layouts disagree).
+                local_addrs = [local_addrs[k] for k in keep]
+                block_len_arr = [block_len_arr[k] for k in keep]
+                block_stride_arr = [block_stride_arr[k] for k in keep]
+                if addr_group_arr:
+                    addr_group_arr = [addr_group_arr[k] for k in keep]
+                if len(local_addrs) != len(remote_kv_caches_base_addrs):
+                    raise ValueError(
+                        f"Cross-PP pull alignment: stage {remote_pp_rank} (layers "
+                        f"[{first_layer},{end_layer})) selected {len(local_addrs)} local addrs "
+                        f"but remote port {remote_handshake_port} advertises "
+                        f"{len(remote_kv_caches_base_addrs)}; P/D kv_cache_tensors layouts disagree"
+                    )
+                stage_groups = sorted({g for groups in addr_group_arr for g in groups}) if addr_group_arr else []
+                logger.info(
+                    "Cross-PP pull alignment: remote_port=%d -> pp_rank=%d layers=[%d,%d) "
+                    "keep=%d/%d addrs, stage groups=%s, remote_addrs=%d",
+                    remote_handshake_port,
+                    remote_pp_rank,
+                    first_layer,
+                    end_layer,
+                    len(keep),
+                    len(self.block_len_per_addr),
+                    stage_groups,
+                    len(remote_kv_caches_base_addrs),
+                )
+            else:
+                # Addr layout has no replayable layer provenance (e.g. the
+                # mamba ptr-dedup walk): keep the uniform per-group slicing.
+                num_groups = len(self.kv_cache_config.kv_cache_tensors)
+                groups_per_stage = num_groups // self._prefill_pp_size
+                addrs_per_group, rem = divmod(len(local_addrs), num_groups)
+                if rem != 0:
+                    raise ValueError("non-uniform per-group address counts unsupported")
+                if num_groups % self._prefill_pp_size != 0:
+                    raise ValueError("pp split not group-aligned")
+                start = remote_pp_rank * groups_per_stage * addrs_per_group
+                end = (remote_pp_rank + 1) * groups_per_stage * addrs_per_group
+                local_addrs = local_addrs[start:end]
+                block_len_arr = self.block_len_per_addr[start:end]
+                block_stride_arr = self.block_stride_per_addr[start:end]
+                if addr_group_arr:
+                    addr_group_arr = self.addr_group_idx[start:end]
 
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
+        if xfer_pairs is None:
+            # Positional pairing over the (possibly sliced) addr lists; same
+            # truncation semantics as the previous zip(local, remote).
+            xfer_pairs = [(k, None) for k in range(min(len(local_addrs), len(remote_kv_caches_base_addrs)))]
         for i in range(self.hma_group_size):
             if not remote_block_ids[i] or not local_block_ids[i]:
                 continue
@@ -707,16 +915,23 @@ class KVCacheRecvingThread(threading.Thread):
             grouped_remote_block_ids, grouped_local_block_ids = group_concurrent_contiguous(
                 cur_remote_block_ids, cur_local_block_ids
             )
-            for k, (src_layer_base_addr, dst_layer_base_addr) in enumerate(
-                zip(local_addrs, remote_kv_caches_base_addrs)
-            ):
+            for k, r in xfer_pairs:
                 if addr_group_arr and i not in addr_group_arr[k]:  # type: ignore[operator]
+                    continue
+                # With content pairs, also require the remote addr to serve
+                # group i so a D addr straddling several remote regions routes
+                # each group to exactly the region that holds it.
+                if r is not None and remote_group_sets is not None and i not in remote_group_sets[r]:
                     continue
                 block_len = block_len_arr[k]
                 block_stride = block_stride_arr[k]
+                remote_base = remote_kv_caches_base_addrs[r if r is not None else k]
+                remote_stride = (
+                    remote_stride_list[r] if (r is not None and remote_stride_list is not None) else block_stride
+                )
                 for remote_block_id, local_block_id in zip(grouped_remote_block_ids, grouped_local_block_ids):
-                    src = src_layer_base_addr + local_block_id[0] * block_stride
-                    dst = dst_layer_base_addr + remote_block_id[0] * block_stride
+                    src = local_addrs[k] + local_block_id[0] * block_stride
+                    dst = remote_base + remote_block_id[0] * remote_stride
                     length = block_len * len(local_block_id)
                     src_list.append(src)
                     dst_list.append(dst)
@@ -991,6 +1206,10 @@ class KVCacheRecvingThread(threading.Thread):
             with self.remote_metadata_lock:
                 self.kv_caches_base_addr[engine_id][remote_handshake_port] = agent_meta.kv_caches_base_addr
                 self.remote_te_port[engine_id][remote_handshake_port] = agent_meta.te_rpc_port
+                self.remote_addr_layer_ids[engine_id][remote_handshake_port] = getattr(
+                    agent_meta, "addr_layer_ids", None
+                )
+                self.remote_block_lens[engine_id][remote_handshake_port] = agent_meta.block_lens
         except Exception:
             if isinstance(sock, zmq.Socket):  # type: ignore
                 sock.close()
@@ -1666,6 +1885,11 @@ class MooncakeConnectorWorker:
         self.block_len_per_addr: list[int] = []
         self.block_stride_per_addr: list[int] = []
         self.addr_group_idx: list[int] = []
+        # Per-addr transformer layer indices (parallel to kv_caches_base_addr,
+        # compress branch only) advertised in the handshake metadata so a
+        # PP pull peer can pair addrs by content.
+        addr_layer_ids: list[list[int]] | None = None
+        num_hidden_layers = self.vllm_config.model_config.hf_text_config.num_hidden_layers
         ptrs = []
         lengths = []
         if not self.use_hybrid:
@@ -1705,6 +1929,7 @@ class MooncakeConnectorWorker:
                     lengths.append(kv_cache_tensor.size)
             self.block_stride_per_addr.extend(self.block_len_per_addr)
         elif self.use_compress:
+            addr_layer_ids = []
             layer_group_idx = dict[str, int]()
             for i, group in enumerate(self.kv_cache_config.kv_cache_groups):
                 for layer_name in group.layer_names:
@@ -1715,7 +1940,11 @@ class MooncakeConnectorWorker:
                 share_tensor_addr = []
                 share_tensor_stride = []
                 cur_tensor_group_idx = []
+                tensor_layer_ids = set()
                 for layer_name in kv_cache_tensor.shared_by:
+                    layer_idx = _parse_layer_idx(layer_name)
+                    if layer_idx is not None and layer_idx < num_hidden_layers:
+                        tensor_layer_ids.add(layer_idx)
                     cur_tensor_group_idx.append(layer_group_idx[layer_name])
                     kv_cache_tuple = kv_caches[layer_name]
                     if not isinstance(kv_cache_tuple, (tuple, list)):
@@ -1729,6 +1958,7 @@ class MooncakeConnectorWorker:
                 cur_tensor_group_idx = sorted(list(set(cur_tensor_group_idx)))
                 self.kv_caches_base_addr.append(min(share_tensor_addr))
                 self.addr_group_idx.append(cur_tensor_group_idx)  # type: ignore[arg-type]
+                addr_layer_ids.append(sorted(tensor_layer_ids))
                 self.block_stride_per_addr.append(share_tensor_stride[0])
                 self.block_len_per_addr.append(share_tensor_stride[0])
                 ptrs.append(min(share_tensor_addr))
@@ -1747,6 +1977,7 @@ class MooncakeConnectorWorker:
             block_lens=self.block_len_per_addr,
             ssm_sizes=self._mamba_ssm_size,
             local_ip=get_ip(),
+            addr_layer_ids=addr_layer_ids,
         )
         self.xfer_handshake_metadata = metadata
 
