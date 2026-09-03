@@ -419,7 +419,8 @@ class KVCacheRecvingThread(threading.Thread):
         self.remote_block_lens: dict[str, dict[int, list[int]]] = SizedDict()
         self.remote_metadata_lock = threading.Lock()
         self._layer_to_group: dict[int, frozenset[int]] | None = None
-        self._pp_align_tables_logged: set[tuple[str, int]] = set()
+        self._pp_align_tables_logged: set[tuple] = set()
+        self._ptr_to_tensor: dict[int, torch.Tensor] = {}
 
         self.request_queue: queue.Queue[Any] = queue.Queue()
         self.executor = ThreadPoolExecutor(max_workers=32)
@@ -709,6 +710,27 @@ class KVCacheRecvingThread(threading.Thread):
             )
         return pairs
 
+    def _debug_read_addr(self, addr: int, block_idx: int = 0) -> list:
+        """First 4 native values of block `block_idx` of the tensor at data_ptr=addr."""
+        if not self._ptr_to_tensor:
+            self._build_ptr_tensor_map()
+        t = self._ptr_to_tensor.get(addr)
+        if t is None:
+            return ["no-tensor@addr"]
+        try:
+            if block_idx >= t.shape[0]:
+                return [f"oob:{block_idx}>={t.shape[0]}"]
+            return t[block_idx].flatten()[:4].tolist()
+        except Exception as e:  # noqa: BLE001
+            return [f"read-err:{e}"]
+
+    def _build_ptr_tensor_map(self) -> None:
+        for kv_tuple in self.kv_caches.values():
+            if not isinstance(kv_tuple, (tuple, list)):
+                kv_tuple = (kv_tuple,)
+            for tensor in kv_tuple:
+                self._ptr_to_tensor[tensor.data_ptr()] = tensor
+
     def _handle_request(self, req_meta: dict[str, Any]):
         request_id = req_meta["request_id"]
         remote_request_id = req_meta["remote_request_id"]
@@ -899,6 +921,34 @@ class KVCacheRecvingThread(threading.Thread):
 
         req_start_time = time.perf_counter()
         src_list, dst_list, length_list = [], [], []
+        debug_segs: list[tuple[int, int, int]] = []
+        debug_dump = (remote_engine_id, remote_handshake_port, "dump") not in self._pp_align_tables_logged
+        if debug_dump:
+            self._pp_align_tables_logged.add((remote_engine_id, remote_handshake_port, "dump"))
+            logger.info(
+                "Cross-PP group map: hma_group_size=%d groups(spec,#layers)=%s",
+                self.hma_group_size,
+                [
+                    (i, type(self.kv_cache_specs[i]).__name__, len(self.kv_cache_config.kv_cache_groups[i].layer_names))
+                    for i in range(self.hma_group_size)
+                ],
+            )
+            logger.info(
+                "Cross-PP block ids per group: %s | count-mismatch groups (full lists): %s",
+                [
+                    (
+                        i,
+                        "L" + str(len(local_block_ids[i])) + str(local_block_ids[i][:3]),
+                        "R" + str(len(remote_block_ids[i])) + str(remote_block_ids[i][:3]),
+                    )
+                    for i in range(min(self.hma_group_size, len(local_block_ids), len(remote_block_ids)))
+                ],
+                [
+                    (i, list(local_block_ids[i]), list(remote_block_ids[i]))
+                    for i in range(min(self.hma_group_size, len(local_block_ids), len(remote_block_ids)))
+                    if len(local_block_ids[i]) != len(remote_block_ids[i])
+                ],
+            )
         if xfer_pairs is None:
             # Positional pairing over the (possibly sliced) addr lists; same
             # truncation semantics as the previous zip(local, remote).
@@ -936,6 +986,19 @@ class KVCacheRecvingThread(threading.Thread):
                     src_list.append(src)
                     dst_list.append(dst)
                     length_list.append(length)
+                    # Debug capture: base addr (data_ptr) + block idx, one
+                    # segment per distinct length class (e.g. 4160/32768 planes).
+                    if debug_dump and length not in [d[2] for d in debug_segs] and len(debug_segs) < 3:
+                        debug_segs.append((local_addrs[k], local_block_id[0], length))
+
+        if debug_dump and debug_segs:
+            dbg_pre = [(hex(a), b, self._debug_read_addr(a, b), ln) for a, b, ln in debug_segs]
+            logger.info(
+                "PP-ALIGN-XFER-DUMP req=%s segments=%d pre_transfer=%s",
+                remote_request_id,
+                len(src_list),
+                dbg_pre,
+            )
 
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
@@ -948,6 +1011,13 @@ class KVCacheRecvingThread(threading.Thread):
 
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
+        if debug_dump and debug_segs:
+            dbg_post = [(hex(a), b, self._debug_read_addr(a, b), ln) for a, b, ln in debug_segs]
+            logger.info(
+                "PP-ALIGN-XFER-DUMP req=%s post_transfer=%s",
+                remote_request_id,
+                dbg_post,
+            )
         logger.info(
             "KV cache transfer for request %s took %.2f ms. local_ip %s local_device_id %s remote_session_id %s",
             remote_request_id,
