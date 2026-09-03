@@ -673,15 +673,18 @@ class KVCacheRecvingThread(threading.Thread):
         end_layer: int,
         keep: list[int],
         remote_layers: list[list[int]],
+        remote_block_lens: list[int] | None = None,
     ) -> list[tuple[int, int]]:
         """Pair D addrs with remote-stage addrs by shared layers, not position.
 
         P-side kv_cache_tensors are packed per stage and may split or merge
         regions differently than D's full-model table, so equal lengths do not
         imply positional correspondence. Each pair (k, r) means: D addr k and
-        remote addr r overlap in at least one layer of [first_layer, end_layer);
-        the per-group filter in the transfer loop routes each group to the
-        exact pair serving it on both sides.
+        remote addr r overlap in at least one layer of [first_layer, end_layer)
+        AND belong to the same plane (equal per-block bytes): a 4160-plane
+        tensor must never be fed from a 32768-plane tensor even when both
+        carry the same layer. The per-group filter in the transfer loop then
+        routes each group to the exact pair serving it on both sides.
         """
         stage_layers = frozenset(range(first_layer, end_layer))
         remote_sets = [stage_layers & frozenset(rl) for rl in remote_layers]
@@ -689,7 +692,12 @@ class KVCacheRecvingThread(threading.Thread):
         unmatched: list[tuple[int, list[int]]] = []
         for k in keep:
             need = self._get_addr_layer_indices()[k] & stage_layers
-            matched = [(k, r) for r, remote_set in enumerate(remote_sets) if need & remote_set]
+            matched = [
+                (k, r)
+                for r, remote_set in enumerate(remote_sets)
+                if need & remote_set
+                and (remote_block_lens is None or remote_block_lens[r] == self.block_len_per_addr[k])
+            ]
             if matched:
                 pairs.extend(matched)
             else:
@@ -711,7 +719,7 @@ class KVCacheRecvingThread(threading.Thread):
         return pairs
 
     def _debug_read_addr(self, addr: int, block_idx: int = 0) -> list:
-        """First 4 native values of block `block_idx` of the tensor at data_ptr=addr."""
+        """Dtype/shape + first 6 native values of block `block_idx` at data_ptr=addr."""
         if not self._ptr_to_tensor:
             self._build_ptr_tensor_map()
         t = self._ptr_to_tensor.get(addr)
@@ -720,7 +728,7 @@ class KVCacheRecvingThread(threading.Thread):
         try:
             if block_idx >= t.shape[0]:
                 return [f"oob:{block_idx}>={t.shape[0]}"]
-            return t[block_idx].flatten()[:4].tolist()
+            return [str(t.dtype).replace("torch.", ""), t.shape[0], t[block_idx].flatten()[:6].tolist()]
         except Exception as e:  # noqa: BLE001
             return [f"read-err:{e}"]
 
@@ -841,7 +849,9 @@ class KVCacheRecvingThread(threading.Thread):
                 # their layer sets overlap inside the stage. No positional or
                 # count assumptions; the transfer loop's per-group filter
                 # (local + remote group membership) routes each group exactly.
-                xfer_pairs = self._build_stage_addr_pairs(first_layer, end_layer, keep, remote_layers)
+                xfer_pairs = self._build_stage_addr_pairs(
+                    first_layer, end_layer, keep, remote_layers, remote_stride_list
+                )
                 remote_group_sets = [self._remote_groups_for_layers(rl) for rl in remote_layers]
                 log_key = (remote_engine_id, remote_handshake_port)
                 if log_key not in self._pp_align_tables_logged:
@@ -986,13 +996,18 @@ class KVCacheRecvingThread(threading.Thread):
                     src_list.append(src)
                     dst_list.append(dst)
                     length_list.append(length)
-                    # Debug capture: base addr (data_ptr) + block idx, one
-                    # segment per distinct length class (e.g. 4160/32768 planes).
-                    if debug_dump and length not in [d[2] for d in debug_segs] and len(debug_segs) < 3:
-                        debug_segs.append((local_addrs[k], local_block_id[0], length))
+                    # Debug capture: one segment per (group, length) class with
+                    # full pairing context for forensics.
+                    if debug_dump and (i, length) not in [(d[3], d[2]) for d in debug_segs] and len(debug_segs) < 6:
+                        debug_segs.append(
+                            (local_addrs[k], local_block_id[0], length, i, k, r, local_block_id[0], remote_block_id[0])
+                        )
 
         if debug_dump and debug_segs:
-            dbg_pre = [(hex(a), b, self._debug_read_addr(a, b), ln) for a, b, ln in debug_segs]
+            dbg_pre = [
+                (hex(a), f"g{gi}:k{k}:r{r}:L{li}:R{ri}", ln, self._debug_read_addr(a, b))
+                for a, b, ln, gi, k, r, li, ri in debug_segs
+            ]
             logger.info(
                 "PP-ALIGN-XFER-DUMP req=%s segments=%d pre_transfer=%s",
                 remote_request_id,
@@ -1012,7 +1027,10 @@ class KVCacheRecvingThread(threading.Thread):
         req_end_time = time.perf_counter()
         req_transfer_elapsed = (req_end_time - req_start_time) * 1000
         if debug_dump and debug_segs:
-            dbg_post = [(hex(a), b, self._debug_read_addr(a, b), ln) for a, b, ln in debug_segs]
+            dbg_post = [
+                (hex(a), f"g{gi}:k{k}:r{r}:L{li}:R{ri}", ln, self._debug_read_addr(a, b))
+                for a, b, ln, gi, k, r, li, ri in debug_segs
+            ]
             logger.info(
                 "PP-ALIGN-XFER-DUMP req=%s post_transfer=%s",
                 remote_request_id,
