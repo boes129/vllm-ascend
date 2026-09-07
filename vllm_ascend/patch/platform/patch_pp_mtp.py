@@ -30,6 +30,8 @@ from itertools import chain
 
 from vllm.logger import logger
 
+from vllm_ascend import envs
+
 _PATCHED = False
 _PP_IN_FLIGHT_STEP = 1 << 60
 
@@ -51,14 +53,25 @@ def _is_pd_prefill_node(vllm_config) -> bool:
 def _use_pp_mtp_runtime_patch(vllm_config, use_pp: bool) -> bool:
     if not _use_pp_ipc_runtime_patch(vllm_config, use_pp):
         return False
+    if _is_pd_prefill_node(vllm_config):
+        # PP+MTP behavior on PD producers is unchanged from #11076.
+        return False
     speculative_config = getattr(vllm_config, "speculative_config", None)
     return speculative_config is not None
 
 
 def _use_pp_ipc_runtime_patch(vllm_config, use_pp: bool) -> bool:
-    if not use_pp or _is_pd_prefill_node(vllm_config):
+    if not use_pp or getattr(vllm_config, "use_v2_model_runner", False):
         return False
-    return not getattr(vllm_config, "use_v2_model_runner", False)
+    if _is_pd_prefill_node(vllm_config):
+        # A PD prefill producer can still serve requests end-to-end (direct
+        # verification traffic, proxy fallback). Disabling the PP IPC runtime
+        # patch there corrupts every locally served request from the second
+        # token on (unfenced batch-queue token handoff). Keep the patch on
+        # by default; pure-PD deployments can restore the #11076 behavior
+        # explicitly.
+        return not envs.VLLM_ASCEND_PD_PREFILL_SKIP_PP_IPC_PATCH
+    return True
 
 
 def _patch_model_runner_output() -> None:

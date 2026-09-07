@@ -71,6 +71,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Whether to skip the PP IPC runtime patch on PD prefill (kv_producer)
+    # nodes. Default "0" (patch active): a producer that also serves local
+    # requests end-to-end (direct-to-P verification traffic, proxy fallback)
+    # needs the PP batch-queue token-handoff fence, and disabling it corrupts
+    # every locally served request from the second token on. Set to "1" only
+    # for pure-PD producers that never decode locally.
+    "VLLM_ASCEND_PD_PREFILL_SKIP_PP_IPC_PATCH": lambda: os.getenv("VLLM_ASCEND_PD_PREFILL_SKIP_PP_IPC_PATCH", "0")
+    == "1",
 }
 
 # end-env-vars-definition

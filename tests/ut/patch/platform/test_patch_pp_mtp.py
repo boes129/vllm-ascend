@@ -12,6 +12,7 @@ from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm_ascend.patch.platform.patch_pp_mtp import (
     _update_pp_mtp_spec_token_ids,
     _use_pp_ipc_runtime_patch,
+    _use_pp_mtp_runtime_patch,
 )
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -100,7 +101,8 @@ def test_pp_ipc_runtime_patch_enabled_for_all_v1_pp(
     assert _use_pp_ipc_runtime_patch(vllm_config, use_pp) is expected
 
 
-def test_pp_ipc_runtime_patch_skips_pd_prefill_node():
+def test_pp_ipc_runtime_patch_active_on_pd_prefill_node_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_ASCEND_PD_PREFILL_SKIP_PP_IPC_PATCH", raising=False)
     vllm_config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(
             is_kv_producer=True,
@@ -111,7 +113,52 @@ def test_pp_ipc_runtime_patch_skips_pd_prefill_node():
         use_v2_model_runner=False,
     )
 
+    assert _use_pp_ipc_runtime_patch(vllm_config, use_pp=True) is True
+
+
+def test_pp_ipc_runtime_patch_opt_out_on_pd_prefill_node(monkeypatch):
+    monkeypatch.setenv("VLLM_ASCEND_PD_PREFILL_SKIP_PP_IPC_PATCH", "1")
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=object(),
+        use_v2_model_runner=False,
+    )
+
     assert _use_pp_ipc_runtime_patch(vllm_config, use_pp=True) is False
+
+
+def test_pp_ipc_runtime_patch_still_excludes_v2_runner_on_pd_prefill_node():
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=object(),
+        use_v2_model_runner=True,
+    )
+
+    assert _use_pp_ipc_runtime_patch(vllm_config, use_pp=True) is False
+
+
+def test_pp_mtp_runtime_patch_still_skips_pd_prefill_node():
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_role="kv_producer"),
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=object(),
+        use_v2_model_runner=False,
+    )
+
+    assert _use_pp_mtp_runtime_patch(vllm_config, use_pp=True) is False
+
+
+def test_pp_mtp_runtime_patch_enabled_with_speculative_config_off_pd():
+    vllm_config = SimpleNamespace(
+        kv_transfer_config=None,
+        scheduler_config=SimpleNamespace(async_scheduling=True),
+        speculative_config=object(),
+        use_v2_model_runner=False,
+    )
+
+    assert _use_pp_mtp_runtime_patch(vllm_config, use_pp=True) is True
 
 
 @pytest.mark.parametrize("async_scheduling", [False, True])
