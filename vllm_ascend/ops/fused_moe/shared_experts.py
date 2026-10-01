@@ -241,7 +241,7 @@ class AscendSharedExperts:
         original_num_tokens = shared_out.shape[0]
         pad_size = (tp_size - original_num_tokens % tp_size) % tp_size
         if pad_size > 0:
-            shared_out = F.pad(shared_out, (0, 0, 0, pad_size))
+            shared_out = _pad_tokens_with_cat(shared_out, original_num_tokens + pad_size)
         return tensor_model_parallel_reduce_scatter(shared_out, dim=0)
 
     def prepare_input_async(
